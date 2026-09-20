@@ -58,7 +58,8 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
     const client = new BatchClient({ apiKey, appId: 'topai-captions', apiUrl });
     const blob = await openAsBlob(path);
     const file = new File([blob], req.file.originalname || 'media');
-    const config = { transcription_config: { language, model } };
+    const transcription_config = model === 'melia-1' ? { model } : { language: language === 'auto' ? 'en' : language, model };
+    const config = { transcription_config };
     const response = await client.transcribe(file, config, 'json-v2');
     const words = normalizeWords(response);
     console.log(`[transcribe] completed words=${words.length}`);
