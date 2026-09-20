@@ -47,7 +47,7 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
   const path = join(tmpdir(), `alvar-${randomUUID()}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
   try {
     await writeFile(path, req.file.buffer);
-    const client = new BatchClient({ apiKey: process.env.SPEECHMATICS_API_KEY, appId: 'alvar-motion-suite' });
+    const client = new BatchClient({ apiKey: process.env.SPEECHMATICS_API_KEY, appId: 'topai-captions', apiUrl: process.env.SPEECHMATICS_API_URL || 'https://eu1.asr.api.speechmatics.com' });
     const blob = await openAsBlob(path);
     const file = new File([blob], req.file.originalname || 'media');
     const config = { transcription_config: { language, model } };
