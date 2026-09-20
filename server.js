@@ -13,7 +13,9 @@ const port = Number(process.env.PORT || 10000);
 const maxMb = Number(process.env.MAX_UPLOAD_MB || 250);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxMb * 1024 * 1024 } });
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
+app.use((req, _res, next) => { console.log(`[request] ${req.method} ${req.path}`); next(); });
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'alvar-caption-api' }));
+app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'alvar-caption-api' }));
 
 function normalizeWords(response) {
   const results = response?.results || [];
@@ -36,6 +38,7 @@ function makeSegments(words, maxChars = 32) {
   return out;
 }
 app.post('/transcribe', upload.single('media'), async (req, res) => {
+  console.log(`[transcribe] received file=${Boolean(req.file)} bytes=${req.file?.size || 0} language=${req.body?.language || 'auto'}`);
   if (!process.env.SPEECHMATICS_API_KEY) return res.status(500).json({ error: 'SPEECHMATICS_API_KEY is not configured on the server' });
   if (!req.file) return res.status(400).json({ error: 'Send an audio/video file in multipart field: media' });
   const language = String(req.body.language || 'auto');
@@ -50,9 +53,10 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
     const config = { transcription_config: { language, model } };
     const response = await client.transcribe(file, config, 'json-v2');
     const words = normalizeWords(response);
+    console.log(`[transcribe] completed words=${words.length}`);
     return res.json({ language: response?.metadata?.transcription_config?.language || language, model, words, segments: makeSegments(words, maxChars), source: 'speechmatics-json-v2' });
   } catch (error) {
-    console.error(error);
+    console.error('[transcribe] Speechmatics error:', error?.stack || error);
     return res.status(502).json({ error: 'Speechmatics transcription failed', detail: error?.message || String(error) });
   } finally { await unlink(path).catch(() => {}); }
 });
