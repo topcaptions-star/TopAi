@@ -47,7 +47,15 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
   const path = join(tmpdir(), `alvar-${randomUUID()}-${req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
   try {
     await writeFile(path, req.file.buffer);
-    const client = new BatchClient({ apiKey: process.env.SPEECHMATICS_API_KEY, appId: 'topai-captions', apiUrl: process.env.SPEECHMATICS_API_URL || 'https://eu1.asr.api.speechmatics.com' });
+    const apiKey = String(process.env.SPEECHMATICS_API_KEY || '').trim();
+    const apiUrl = process.env.SPEECHMATICS_API_URL || 'https://eu1.asr.api.speechmatics.com';
+    const authCheck = await fetch(`${apiUrl}/v2/jobs?sm-app=topai-captions`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    if (!authCheck.ok) {
+      const contentType = authCheck.headers.get('content-type') || 'unknown';
+      const body = (await authCheck.text()).slice(0, 160).replace(/\s+/g, ' ');
+      throw new Error(`Speechmatics authentication failed: HTTP ${authCheck.status}, content-type=${contentType}, response=${body}`);
+    }
+    const client = new BatchClient({ apiKey, appId: 'topai-captions', apiUrl });
     const blob = await openAsBlob(path);
     const file = new File([blob], req.file.originalname || 'media');
     const config = { transcription_config: { language, model } };
@@ -56,8 +64,11 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
     console.log(`[transcribe] completed words=${words.length}`);
     return res.json({ language: response?.metadata?.transcription_config?.language || language, model, words, segments: makeSegments(words, maxChars), source: 'speechmatics-json-v2' });
   } catch (error) {
-    console.error('[transcribe] Speechmatics error:', error?.stack || error);
-    return res.status(502).json({ error: 'Speechmatics transcription failed', detail: error?.message || String(error) });
+    const safeDetails = {};
+    for (const key of Object.getOwnPropertyNames(error || {})) { if (key !== 'apiKey') safeDetails[key] = error[key]; }
+    if (error?.response) safeDetails.response = error.response;
+    console.error('[transcribe] Speechmatics error:', JSON.stringify(safeDetails), error?.stack || '');
+    return res.status(502).json({ error: 'Speechmatics transcription failed', detail: error?.response?.detail || error?.message || String(error), code: error?.response?.code || error?.code || null, speechmaticsError: error?.response?.error || error?.error || null });
   } finally { await unlink(path).catch(() => {}); }
 });
 app.use((err, _req, res, _next) => { if (err?.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `File exceeds ${maxMb}MB limit` }); res.status(500).json({ error: err.message || 'Server error' }); });
