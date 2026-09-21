@@ -1,14 +1,23 @@
 {
-  "name": "alvar-caption-api",
-  "version": "0.1.0",
+  "name": "topai-api",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "scripts": {"start": "node server.js"},
-  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@speechmatics/batch-client": "latest",
+    "@tensorflow-models/face-detection": "^1.0.3",
+    "@tensorflow/tfjs-node": "^4.22.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "ffmpeg-static": "^5.2.0",
+    "multer": "^2.0.2",
+    "sharp": "^0.34.3"
   }
 }

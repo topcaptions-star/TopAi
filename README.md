@@ -1,33 +1,45 @@
-# Alvar Caption API
+# TopAi Render API
 
-שרת Backend קטן ל-Render. הוא מחזיק את `SPEECHMATICS_API_KEY` ומעולם לא שולח אותו לפלאגין.
+Node.js backend for the TopAi After Effects CEP panel.
 
-## Render
+## Render deployment
 
-1. צור Web Service חדש וחבר את התיקייה הזו ל-Repository.
-2. Build Command: `npm install`
-3. Start Command: `npm start`
-4. הוסף ב-Environment:
+1. Connect this repository as a Render Web Service.
+2. Set **Build Command** to `npm install`.
+3. Set **Start Command** to `npm start`.
+4. Add server-only values in **Render Dashboard → Environment**:
 
 ```text
-SPEECHMATICS_API_KEY=המפתח שלך
+SPEECHMATICS_API_KEY=your_secret_key
 ALLOWED_ORIGIN=*
 MAX_UPLOAD_MB=250
+MAX_TRACK_SECONDS=60
+MAX_TRACK_FRAMES=360
+TRACK_TIMEOUT_MS=240000
 ```
 
-אל תכניס את המפתח ל-GitHub, ל-ZXP או לקוד JavaScript.
+Never put the Speechmatics key in GitHub, the ZXP, or panel JavaScript.
 
 ## Endpoints
 
-- `GET /health` — בדיקת חיבור.
-- `POST /transcribe` — multipart field בשם `media`; שדות אופציונליים: `language` (`auto`, `he`, `en`, וכו'), `model` (`melia-1`, `standard`, `enhanced`) ו-`maxChars`.
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Health and tracking capability |
+| `GET /healthz` | Basic health check |
+| `POST /transcribe` | Speechmatics transcript from multipart `media` WAV/video |
+| `POST /track-face` | Original server-side face detection from multipart MP4 `media` |
 
-השרת מוחק את קובץ המדיה הזמני לאחר סיום הבקשה ומחזיר JSON עם `words` ו-`segments`.
+`/track-face` extracts a capped number of low-resolution frames, detects the most consistent face, smooths the normalized center/size/rotation points, and returns the keyframes required by After Effects. It contains no EXE, JSXBIN, or third-party plug-in UI.
 
-## בדיקה
+All uploaded media, decoded frames, and temporary files are removed after each request.
+
+## Local test
 
 ```bash
-curl https://YOUR-SERVICE.onrender.com/health
-curl -X POST https://YOUR-SERVICE.onrender.com/transcribe \
-  -F media=@sample.wav -F language=he -F model=melia-1
+npm install
+cp .env.example .env
+npm start
+curl http://localhost:10000/health
 ```
+
+`SPEECHMATICS_API_KEY` is required only for `/transcribe`; `/track-face` does not use it.
