@@ -29,7 +29,7 @@ Never put the Speechmatics key in GitHub, the ZXP, or panel JavaScript.
 | `POST /transcribe` | Speechmatics transcript from multipart `media` WAV/video |
 | `POST /track-face` | MediaPipe FaceMesh 478-landmark tracking from multipart MP4 `media` |
 
-`/track-face` extracts a capped number of low-resolution frames, runs MediaPipe FaceMesh with 478 landmarks, follows the most consistent face, smooths head and feature points, and returns keyframes for the After Effects Head, Left Eye, Right Eye, Nose, and Mouth Nulls. It contains no EXE, JSXBIN, or third-party plug-in UI.
+`/track-face` extracts a capped number of low-resolution frames, runs MediaPipe FaceMesh with 478 landmarks, follows the most consistent face, and returns smoothed position, scale, and rotation values. TopAi writes those values as keyed `TopAi FaceMesh` Effect Controls directly on the selected source layer. The CEP client uses a half-resolution proxy and a fixed 48-frame adaptive budget to keep normal requests fast. The service contains no EXE, JSXBIN, or third-party plug-in UI.
 
 All uploaded media, decoded frames, and temporary files are removed after each request.
 

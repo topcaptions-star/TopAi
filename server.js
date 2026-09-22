@@ -17,7 +17,7 @@ const app = express();
 const port = Number(process.env.PORT || 10000);
 const maxMb = Number(process.env.MAX_UPLOAD_MB || 250);
 const maxTrackSeconds = Number(process.env.MAX_TRACK_SECONDS || 60);
-const maxTrackFrames = Number(process.env.MAX_TRACK_FRAMES || 360);
+const maxTrackFrames = clamp(Number(process.env.MAX_TRACK_FRAMES || 96), 12, 96);
 const processTimeoutMs = Number(process.env.TRACK_TIMEOUT_MS || 240000);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxMb * 1024 * 1024 } });
 let detectorPromise = null;
@@ -86,7 +86,7 @@ async function trackFace(videoPath, sampleFps, maxFrames, maxSeconds) {
   const workingDir = await mkdtemp(join(tmpdir(), 'topai-track-'));
   try {
     const pattern = join(workingDir, 'frame-%06d.jpg');
-    await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-t', String(maxSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=640:-2`, '-frames:v', String(maxFrames), '-q:v', '3', pattern]);
+    await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-t', String(maxSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=512:-2:force_original_aspect_ratio=decrease`, '-frames:v', String(maxFrames), '-q:v', '4', pattern]);
     const frameFiles = (await readdir(workingDir)).filter(file => file.endsWith('.jpg')).sort();
     if (!frameFiles.length) throw Object.assign(new Error('No frames extracted'), { publicMessage: 'The uploaded clip did not contain decodable video frames.' });
     const detector = await getDetector();
@@ -167,13 +167,15 @@ app.post('/track-face', upload.single('media'), async (req, res) => {
   const requestId = randomUUID();
   const started = Date.now();
   if (!req.file) return res.status(400).json({ error: 'Send a video file in multipart field: media' });
-  const sampleFps = clamp(delaySafeNumber(req.body.sampleFps, 6), 2, 12);
+  const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 4), 2, 12);
   const maxFrames = clamp(Math.round(delaySafeNumber(req.body.maxFrames, maxTrackFrames)), 12, maxTrackFrames);
+  const durationSeconds = clamp(delaySafeNumber(req.body.durationSeconds, maxTrackSeconds), 1, maxTrackSeconds);
+  const sampleFps = Math.max(1, Math.min(requestedFps, maxFrames / durationSeconds));
   const mediaPath = join(tmpdir(), `topai-track-source-${requestId}-${safeName(req.file.originalname)}`);
   try {
-    console.log(JSON.stringify({ event: 'track_received', requestId, bytes: req.file.size, sampleFps, maxFrames }));
+    console.log(JSON.stringify({ event: 'track_received', requestId, bytes: req.file.size, requestedFps, sampleFps, maxFrames, durationSeconds }));
     await writeFile(mediaPath, req.file.buffer);
-    const tracked = await trackFace(mediaPath, sampleFps, maxFrames, maxTrackSeconds);
+    const tracked = await trackFace(mediaPath, sampleFps, maxFrames, durationSeconds);
     console.log(JSON.stringify({ event: 'track_done', requestId, points: tracked.points.length, durationMs: Date.now() - started }));
     return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-mediapipe-facemesh-478', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.62' } });
   } catch (error) {
