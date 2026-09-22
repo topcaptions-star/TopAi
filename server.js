@@ -143,6 +143,14 @@ async function imageFaces(path) {
     return { faces, width: buffer.info.width, height: buffer.info.height, engine };
   } finally { image.dispose(); }
 }
+async function imageFaceBoxes(path) {
+  const buffer = await sharp(path).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
+  try {
+    const faces = await (await getFallbackDetector()).estimateFaces(image, { flipHorizontal: false });
+    return { faces, width: buffer.info.width, height: buffer.info.height, engine: 'face-detector-preview' };
+  } finally { image.dispose(); }
+}
 async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, seed, sourceStart = 0) {
   if (!ffmpegPath) throw Object.assign(new Error('ffmpeg-static unavailable'), { publicMessage: 'Face tracking engine is unavailable on the server.' });
   const workingDir = await mkdtemp(join(tmpdir(), 'topai-center-'));
@@ -186,14 +194,15 @@ async function previewFaces(videoPath, durationSeconds, sourceStart = 0) {
       const offset = offsets[index]; const framePath = join(workingDir, `preview-${index}.jpg`);
       await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + offset), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=960:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
       try { await access(framePath); } catch (_missingFrame) { continue; }
-      const faceData = await imageFaces(framePath);
+      const faceData = await imageFaceBoxes(framePath);
       if (!faceData.faces.length) continue;
       const largestArea = Math.max(...faceData.faces.map(faceArea));
-      if (!best || largestArea > best.largestArea) best = { framePath, faceData, offset, largestArea };
+      best = { framePath, faceData, offset, largestArea, scannedFrames: index + 1 };
+      break;
     }
     if (!best) throw Object.assign(new Error('No face found in preview samples'), { publicMessage: 'No face was found across six points in the Work Area. Move the Work Area to include a clear front-facing face, then retry.' });
     const image = await readFile(best.framePath);
-    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: best.faceData.width, height: best.faceData.height, time: best.offset, sampleCount: offsets.length, detector: best.faceData.engine, faces: best.faceData.faces.map((face, index) => normalizeFace(face, best.faceData.width, best.faceData.height, index)) };
+    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: best.faceData.width, height: best.faceData.height, time: best.offset, sampleCount: offsets.length, scannedFrames: best.scannedFrames, detector: best.faceData.engine, faces: best.faceData.faces.map((face, index) => normalizeFace(face, best.faceData.width, best.faceData.height, index)) };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
 
