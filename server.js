@@ -4,6 +4,7 @@ import multer from 'multer';
 import { mkdtemp, readdir, rm, unlink, writeFile, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { openAsBlob } from 'node:fs';
@@ -11,6 +12,7 @@ import { BatchClient } from '@speechmatics/batch-client';
 import * as tf from '@tensorflow/tfjs-node';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
 import * as faceDetection from '@tensorflow-models/face-detection';
+import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import ffmpegPath from 'ffmpeg-static';
 import sharp from 'sharp';
 
@@ -20,9 +22,11 @@ const maxMb = Number(process.env.MAX_UPLOAD_MB || 250);
 const maxTrackSeconds = Number(process.env.MAX_TRACK_SECONDS || 60);
 const maxTrackFrames = clamp(Number(process.env.MAX_TRACK_FRAMES || 96), 12, 96);
 const processTimeoutMs = Number(process.env.TRACK_TIMEOUT_MS || 240000);
+const personModelUrl = pathToFileURL(join(process.cwd(), 'models', 'coco-ssd', 'model.json')).href;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxMb * 1024 * 1024 } });
 let detectorPromise = null;
 let fallbackDetectorPromise = null;
+let personDetectorPromise = null;
 
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
@@ -67,10 +71,27 @@ async function getFallbackDetector() {
   }
   return fallbackDetectorPromise;
 }
+async function getPersonDetector() {
+  if (!personDetectorPromise) {
+    personDetectorPromise = (async () => {
+      await tf.setBackend('cpu');
+      await tf.ready();
+      return cocoSsd.load({ base: 'lite_mobilenet_v2', modelUrl: personModelUrl });
+    })();
+  }
+  return personDetectorPromise;
+}
 
 function faceArea(face) { return Math.max(0, face.box.width) * Math.max(0, face.box.height); }
 function faceCenter(face) { return { x: face.box.xMin + face.box.width / 2, y: face.box.yMin + face.box.height / 2 }; }
 function landmark(face, index) { return face.keypoints?.[index] || null; }
+function predictionsToSubjects(predictions) {
+  return predictions.filter(item => item.class === 'person').map(item => ({
+    box: { xMin: item.bbox[0], yMin: item.bbox[1], width: item.bbox[2], height: item.bbox[3] },
+    score: item.score,
+    keypoints: []
+  }));
+}
 function normalizeFace(face, width, height, index) {
   const nose = landmark(face, 1) || faceCenter(face);
   const leftEye = landmark(face, 33); const rightEye = landmark(face, 263);
@@ -134,16 +155,29 @@ async function extractFrames(videoPath, workingDir, sampleFps, maxFrames, durati
   return (await readdir(workingDir)).filter(file => file.endsWith('.jpg')).sort();
 }
 async function imageFaces(path) {
+  const people = await imagePersons(path, 'person-detector-tracking');
+  if (people.faces.length) return people;
   const buffer = await sharp(path).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
   try {
     let faces = await (await getDetector()).estimateFaces(image, { flipHorizontal: false });
     let engine = 'facemesh';
     if (!faces.length) { faces = await (await getFallbackDetector()).estimateFaces(image, { flipHorizontal: false }); engine = 'face-detector-fallback'; }
+    if (!faces.length) { faces = predictionsToSubjects(await (await getPersonDetector()).detect(image, 10, 0.2)); engine = 'person-detector-fallback'; }
+    return { faces, width: buffer.info.width, height: buffer.info.height, engine };
+  } finally { image.dispose(); }
+}
+async function imagePersons(path, engine = 'person-detector-tracking') {
+  const buffer = await sharp(path).resize({ width: 640, withoutEnlargement: true }).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
+  try {
+    const faces = predictionsToSubjects(await (await getPersonDetector()).detect(image, 10, 0.2));
     return { faces, width: buffer.info.width, height: buffer.info.height, engine };
   } finally { image.dispose(); }
 }
 async function imageFaceBoxes(path) {
+  const people = await imagePersons(path, 'person-detector-preview');
+  if (people.faces.length) return people;
   const buffer = await sharp(path).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
   try {
@@ -159,9 +193,12 @@ async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, 
     if (!frameFiles.length) throw Object.assign(new Error('No frames extracted'), { publicMessage: 'The uploaded clip did not contain decodable video frames.' });
     const cuts = await detectCuts(videoPath, durationSeconds, sourceStart).catch(error => { console.warn(JSON.stringify({ event: 'cut_detect_warning', error: error.message })); return []; });
     const shots = shotsFromCuts(cuts, durationSeconds);
-    const rawPoints = []; let prior = null;
+    const rawPoints = []; let prior = null; let personTracking = false;
     for (let index = 0; index < frameFiles.length; index += 1) {
-      const { faces, width, height } = await imageFaces(join(workingDir, frameFiles[index]));
+      const framePath = join(workingDir, frameFiles[index]);
+      const data = personTracking ? await imagePersons(framePath) : await imageFaces(framePath);
+      const { faces, width, height } = data;
+      if (data.engine === 'person-detector-fallback') personTracking = true;
       const pick = chooseFace(faces, prior ? null : seed, prior, width, height);
       if (!pick) continue;
       prior = pick.candidate;
@@ -278,7 +315,7 @@ app.post('/track-preview', upload.single('media'), async (req, res) => {
 app.post('/auto-face-center', upload.single('media'), async (req, res) => {
   const requestId = randomUUID(); const started = Date.now();
   if (!req.file) return res.status(400).json({ error: 'Send a video file in multipart field: media' });
-  const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 6), 2, 12);
+  const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 3), 1, 3);
   const maxFrames = clamp(Math.round(delaySafeNumber(req.body.maxFrames, maxTrackFrames)), 12, maxTrackFrames);
   const durationSeconds = clamp(delaySafeNumber(req.body.durationSeconds, maxTrackSeconds), 1, maxTrackSeconds);
   const sampleFps = Math.max(1, Math.min(requestedFps, maxFrames / durationSeconds));
