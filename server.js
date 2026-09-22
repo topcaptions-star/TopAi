@@ -2,11 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { mkdtemp, readdir, rm, unlink, writeFile, readFile, access } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, setPriority } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, fork } from 'node:child_process';
 import { openAsBlob } from 'node:fs';
 import { BatchClient } from '@speechmatics/batch-client';
 import * as tf from '@tensorflow/tfjs-node';
@@ -31,7 +31,7 @@ let personDetectorPromise = null;
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use((req, _res, next) => { console.log(JSON.stringify({ event: 'request', method: req.method, path: req.path })); next(); });
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-facemesh-face-detector-autofacecenter', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames, workflow: 'multi-preview-select-shot-aware-center' } }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-person-worker-autosubjectcenter', maxTrackSeconds, maxTrackFrames, workflow: 'worker-preview-select-center' } }));
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'topai-api' }));
 
 function safeName(name = 'media') { return String(name).replace(/[^a-zA-Z0-9._-]/g, '_'); }
@@ -48,6 +48,21 @@ function run(command, args, timeoutMs = processTimeoutMs) {
     child.stderr.on('data', chunk => { stderr += chunk.toString(); if (stderr.length > 12000) stderr = stderr.slice(-12000); });
     child.once('error', error => { clearTimeout(timer); reject(error); });
     child.once('close', code => { clearTimeout(timer); code === 0 ? resolve(stderr) : reject(Object.assign(new Error(`ffmpeg exited ${code}: ${stderr}`), { publicMessage: 'Could not decode the selected video for face tracking.' })); });
+  });
+}
+function runTrackingWorker(workerData) {
+  return new Promise((resolve, reject) => {
+    const child = fork(new URL('./tracking-worker.js', import.meta.url), [], { env: { ...process.env, TOPAI_TRACKING_JOB: JSON.stringify(workerData) }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    try { setPriority(child.pid, 19); } catch (_priorityError) {}
+    let settled = false;
+    const finish = (callback, value) => { if (settled) return; settled = true; clearTimeout(timer); callback(value); };
+    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(reject, Object.assign(new Error('Worker timed out'), { publicMessage: 'Auto Center timed out while analyzing the video.' })); }, processTimeoutMs);
+    child.once('message', message => {
+      clearTimeout(timer);
+      message?.ok ? finish(resolve, message.data) : finish(reject, Object.assign(new Error(message?.error || 'Auto Center worker failed'), { publicMessage: message?.error || 'Auto Center worker failed.' }));
+    });
+    child.once('error', error => finish(reject, error));
+    child.once('exit', code => { if (code !== 0) finish(reject, Object.assign(new Error(`Worker exited ${code}`), { publicMessage: 'Auto Center processing stopped unexpectedly.' })); });
   });
 }
 
@@ -302,9 +317,9 @@ app.post('/track-preview', upload.single('media'), async (req, res) => {
   try {
     console.log(JSON.stringify({ event: 'preview_received', requestId, bytes: req.file.size, durationSeconds, sourceStart }));
     await writeFile(mediaPath, req.file.buffer);
-    const preview = await previewFaces(mediaPath, durationSeconds, sourceStart);
+    const preview = await runTrackingWorker({ action: 'preview', videoPath: mediaPath, durationSeconds, sourceStart });
     console.log(JSON.stringify({ event: 'preview_done', requestId, faces: preview.faces.length }));
-    return res.json({ ok: true, preview, engine: 'topai-mediapipe-facemesh-478' });
+    return res.json({ ok: true, preview, engine: 'topai-person-worker' });
   } catch (error) {
     const status = error?.publicMessage?.startsWith('No stable') ? 422 : 502;
     console.error(JSON.stringify({ event: 'preview_error', requestId, error: error.message }));
@@ -326,9 +341,9 @@ app.post('/auto-face-center', upload.single('media'), async (req, res) => {
   try {
     console.log(JSON.stringify({ event: 'center_received', requestId, bytes: req.file.size, requestedFps, sampleFps, maxFrames, durationSeconds, sourceStart, hasSeed: Boolean(seed) }));
     await writeFile(mediaPath, req.file.buffer);
-    const tracked = await autoFaceCenter(mediaPath, sampleFps, maxFrames, durationSeconds, seed, sourceStart);
+    const tracked = await runTrackingWorker({ action: 'track', videoPath: mediaPath, durationSeconds, sourceStart, sampleFps, maxFrames, seed });
     console.log(JSON.stringify({ event: 'center_done', requestId, shots: tracked.shots.length, cuts: tracked.cuts.length, points: tracked.shots.reduce((count, shot) => count + shot.points.length, 0), durationMs: Date.now() - started }));
-    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-mediapipe-autofacecenter', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.38', composition: 'shot-aware-reframe' } });
+    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-person-worker-autosubjectcenter', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.42', composition: 'subject-center' } });
   } catch (error) {
     const status = error?.publicMessage?.startsWith('No') ? 422 : 502;
     console.error(JSON.stringify({ event: 'center_error', requestId, error: error.message }));
