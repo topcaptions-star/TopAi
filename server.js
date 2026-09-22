@@ -10,6 +10,7 @@ import { openAsBlob } from 'node:fs';
 import { BatchClient } from '@speechmatics/batch-client';
 import * as tf from '@tensorflow/tfjs-node';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
+import * as faceDetection from '@tensorflow-models/face-detection';
 import ffmpegPath from 'ffmpeg-static';
 import sharp from 'sharp';
 
@@ -21,11 +22,12 @@ const maxTrackFrames = clamp(Number(process.env.MAX_TRACK_FRAMES || 96), 12, 96)
 const processTimeoutMs = Number(process.env.TRACK_TIMEOUT_MS || 240000);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxMb * 1024 * 1024 } });
 let detectorPromise = null;
+let fallbackDetectorPromise = null;
 
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use((req, _res, next) => { console.log(JSON.stringify({ event: 'request', method: req.method, path: req.path })); next(); });
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-mediapipe-facemesh-autofacecenter', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames, workflow: 'preview-select-shot-aware-center' } }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-facemesh-face-detector-autofacecenter', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames, workflow: 'multi-preview-select-shot-aware-center' } }));
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'topai-api' }));
 
 function safeName(name = 'media') { return String(name).replace(/[^a-zA-Z0-9._-]/g, '_'); }
@@ -54,6 +56,16 @@ async function getDetector() {
     })();
   }
   return detectorPromise;
+}
+async function getFallbackDetector() {
+  if (!fallbackDetectorPromise) {
+    fallbackDetectorPromise = (async () => {
+      await tf.setBackend('cpu');
+      await tf.ready();
+      return faceDetection.createDetector(faceDetection.SupportedModels.MediaPipeFaceDetector, { runtime: 'tfjs', maxFaces: 5, modelType: 'short' });
+    })();
+  }
+  return fallbackDetectorPromise;
 }
 
 function faceArea(face) { return Math.max(0, face.box.width) * Math.max(0, face.box.height); }
@@ -118,15 +130,17 @@ function shotsFromCuts(cuts, duration) {
 }
 async function extractFrames(videoPath, workingDir, sampleFps, maxFrames, durationSeconds, sourceStart = 0) {
   const pattern = join(workingDir, 'frame-%06d.jpg');
-  await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart), '-t', String(durationSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=640:-2:force_original_aspect_ratio=decrease`, '-frames:v', String(maxFrames), '-q:v', '4', pattern]);
+  await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart), '-t', String(durationSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=960:-2:force_original_aspect_ratio=decrease`, '-frames:v', String(maxFrames), '-q:v', '4', pattern]);
   return (await readdir(workingDir)).filter(file => file.endsWith('.jpg')).sort();
 }
 async function imageFaces(path) {
   const buffer = await sharp(path).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
   try {
-    const faces = await (await getDetector()).estimateFaces(image, { flipHorizontal: false });
-    return { faces, width: buffer.info.width, height: buffer.info.height };
+    let faces = await (await getDetector()).estimateFaces(image, { flipHorizontal: false });
+    let engine = 'facemesh';
+    if (!faces.length) { faces = await (await getFallbackDetector()).estimateFaces(image, { flipHorizontal: false }); engine = 'face-detector-fallback'; }
+    return { faces, width: buffer.info.width, height: buffer.info.height, engine };
   } finally { image.dispose(); }
 }
 async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, seed, sourceStart = 0) {
@@ -170,7 +184,7 @@ async function previewFaces(videoPath, durationSeconds, sourceStart = 0) {
     const offsets = previewOffsets(durationSeconds);
     for (let index = 0; index < offsets.length; index += 1) {
       const offset = offsets[index]; const framePath = join(workingDir, `preview-${index}.jpg`);
-      await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + offset), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
+      await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + offset), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=960:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
       try { await access(framePath); } catch (_missingFrame) { continue; }
       const faceData = await imageFaces(framePath);
       if (!faceData.faces.length) continue;
@@ -179,7 +193,7 @@ async function previewFaces(videoPath, durationSeconds, sourceStart = 0) {
     }
     if (!best) throw Object.assign(new Error('No face found in preview samples'), { publicMessage: 'No face was found across six points in the Work Area. Move the Work Area to include a clear front-facing face, then retry.' });
     const image = await readFile(best.framePath);
-    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: best.faceData.width, height: best.faceData.height, time: best.offset, sampleCount: offsets.length, faces: best.faceData.faces.map((face, index) => normalizeFace(face, best.faceData.width, best.faceData.height, index)) };
+    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: best.faceData.width, height: best.faceData.height, time: best.offset, sampleCount: offsets.length, detector: best.faceData.engine, faces: best.faceData.faces.map((face, index) => normalizeFace(face, best.faceData.width, best.faceData.height, index)) };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
 
