@@ -27,6 +27,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: max
 let detectorPromise = null;
 let fallbackDetectorPromise = null;
 let personDetectorPromise = null;
+const centerJobs = new Map();
 
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
@@ -64,6 +65,30 @@ function runTrackingWorker(workerData) {
     child.once('error', error => finish(reject, error));
     child.once('exit', code => { if (code !== 0) finish(reject, Object.assign(new Error(`Worker exited ${code}`), { publicMessage: 'Auto Center processing stopped unexpectedly.' })); });
   });
+}
+function expireCenterJob(jobId) {
+  const job = centerJobs.get(jobId);
+  if (!job) return;
+  centerJobs.delete(jobId);
+  if (job.mediaPath) unlink(job.mediaPath).catch(() => {});
+}
+function createCenterJob({ mediaPath, sampleFps, maxFrames, durationSeconds, sourceStart, seed }) {
+  const jobId = randomUUID();
+  const job = { id: jobId, state: 'processing', createdAt: Date.now(), mediaPath, result: null, error: null };
+  centerJobs.set(jobId, job);
+  runTrackingWorker({ action: 'track', videoPath: mediaPath, durationSeconds, sourceStart, sampleFps, maxFrames, seed })
+    .then(tracked => {
+      job.state = 'complete';
+      job.result = { ...tracked, engine: 'topai-person-worker-autosubjectcenter', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.42', composition: 'subject-center' };
+      console.log(JSON.stringify({ event: 'center_job_done', jobId, points: tracked.shots.reduce((count, shot) => count + shot.points.length, 0), durationMs: Date.now() - job.createdAt }));
+    })
+    .catch(error => {
+      job.state = 'failed';
+      job.error = publicError(error, 'Auto Center failed');
+      console.error(JSON.stringify({ event: 'center_job_error', jobId, error: error.message }));
+    })
+    .finally(() => { if (job.mediaPath) unlink(job.mediaPath).catch(() => {}); job.mediaPath = null; setTimeout(() => expireCenterJob(jobId), 10 * 60 * 1000); });
+  return job;
 }
 
 async function getDetector() {
@@ -328,7 +353,7 @@ app.post('/track-preview', upload.single('media'), async (req, res) => {
 });
 
 app.post('/auto-face-center', upload.single('media'), async (req, res) => {
-  const requestId = randomUUID(); const started = Date.now();
+  const requestId = randomUUID();
   if (!req.file) return res.status(400).json({ error: 'Send a video file in multipart field: media' });
   const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 3), 1, 3);
   const maxFrames = clamp(Math.round(delaySafeNumber(req.body.maxFrames, maxTrackFrames)), 12, maxTrackFrames);
@@ -341,14 +366,20 @@ app.post('/auto-face-center', upload.single('media'), async (req, res) => {
   try {
     console.log(JSON.stringify({ event: 'center_received', requestId, bytes: req.file.size, requestedFps, sampleFps, maxFrames, durationSeconds, sourceStart, hasSeed: Boolean(seed) }));
     await writeFile(mediaPath, req.file.buffer);
-    const tracked = await runTrackingWorker({ action: 'track', videoPath: mediaPath, durationSeconds, sourceStart, sampleFps, maxFrames, seed });
-    console.log(JSON.stringify({ event: 'center_done', requestId, shots: tracked.shots.length, cuts: tracked.cuts.length, points: tracked.shots.reduce((count, shot) => count + shot.points.length, 0), durationMs: Date.now() - started }));
-    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-person-worker-autosubjectcenter', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.42', composition: 'subject-center' } });
+    const job = createCenterJob({ mediaPath, sampleFps, maxFrames, durationSeconds, sourceStart, seed });
+    return res.status(202).json({ ok: true, state: job.state, jobId: job.id, pollUrl: `/auto-center-jobs/${job.id}` });
   } catch (error) {
     const status = error?.publicMessage?.startsWith('No') ? 422 : 502;
     console.error(JSON.stringify({ event: 'center_error', requestId, error: error.message }));
     return res.status(status).json({ error: publicError(error, 'Auto Face Center failed') });
-  } finally { await unlink(mediaPath).catch(() => {}); }
+  }
+});
+app.get('/auto-center-jobs/:jobId', (req, res) => {
+  const job = centerJobs.get(String(req.params.jobId));
+  if (!job) return res.status(404).json({ error: 'Auto Center job expired or the server restarted. Please retry.' });
+  if (job.state === 'complete') return res.json({ ok: true, state: 'complete', tracking: job.result });
+  if (job.state === 'failed') return res.status(422).json({ ok: false, state: 'failed', error: job.error || 'Auto Center failed.' });
+  return res.status(202).json({ ok: true, state: 'processing', elapsedSeconds: Math.round((Date.now() - job.createdAt) / 1000) });
 });
 
 app.use((err, _req, res, _next) => {
