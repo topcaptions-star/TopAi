@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { mkdtemp, readdir, rm, unlink, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, unlink, writeFile, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -137,10 +137,10 @@ async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, 
     if (!frameFiles.length) throw Object.assign(new Error('No frames extracted'), { publicMessage: 'The uploaded clip did not contain decodable video frames.' });
     const cuts = await detectCuts(videoPath, durationSeconds, sourceStart).catch(error => { console.warn(JSON.stringify({ event: 'cut_detect_warning', error: error.message })); return []; });
     const shots = shotsFromCuts(cuts, durationSeconds);
-    const rawPoints = []; let prior = seed || null;
+    const rawPoints = []; let prior = null;
     for (let index = 0; index < frameFiles.length; index += 1) {
       const { faces, width, height } = await imageFaces(join(workingDir, frameFiles[index]));
-      const pick = chooseFace(faces, seed, prior, width, height);
+      const pick = chooseFace(faces, prior ? null : seed, prior, width, height);
       if (!pick) continue;
       prior = pick.candidate;
       rawPoints.push({ time: rounded(index / sampleFps, 4), x: pick.candidate.x, y: pick.candidate.y, confidence: pick.candidate.score });
@@ -152,14 +152,34 @@ async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, 
     return { sampleFps, framesAnalyzed: frameFiles.length, landmarksPerFace: 478, cuts, shots: enrichedShots };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
+function previewOffsets(durationSeconds) {
+  const duration = Math.max(0.1, Number(durationSeconds) || 0.1);
+  const values = [0.4, duration * 0.15, duration * 0.32, duration * 0.5, duration * 0.68, duration * 0.85];
+  const output = [];
+  for (const value of values) {
+    const offset = rounded(clamp(value, 0, Math.max(0, duration - 0.08)), 3);
+    if (!output.some(existing => Math.abs(existing - offset) < 0.15)) output.push(offset);
+  }
+  return output;
+}
 async function previewFaces(videoPath, durationSeconds, sourceStart = 0) {
   if (!ffmpegPath) throw Object.assign(new Error('ffmpeg-static unavailable'), { publicMessage: 'Face tracking engine is unavailable on the server.' });
   const workingDir = await mkdtemp(join(tmpdir(), 'topai-preview-'));
   try {
-    const framePath = join(workingDir, 'preview.jpg');
-    await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + Math.min(0.4, Math.max(0, durationSeconds / 8))), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
-    const [image, faceData] = await Promise.all([readFile(framePath), imageFaces(framePath)]);
-    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: faceData.width, height: faceData.height, faces: faceData.faces.map((face, index) => normalizeFace(face, faceData.width, faceData.height, index)) };
+    let best = null;
+    const offsets = previewOffsets(durationSeconds);
+    for (let index = 0; index < offsets.length; index += 1) {
+      const offset = offsets[index]; const framePath = join(workingDir, `preview-${index}.jpg`);
+      await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + offset), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
+      try { await access(framePath); } catch (_missingFrame) { continue; }
+      const faceData = await imageFaces(framePath);
+      if (!faceData.faces.length) continue;
+      const largestArea = Math.max(...faceData.faces.map(faceArea));
+      if (!best || largestArea > best.largestArea) best = { framePath, faceData, offset, largestArea };
+    }
+    if (!best) throw Object.assign(new Error('No face found in preview samples'), { publicMessage: 'No face was found across six points in the Work Area. Move the Work Area to include a clear front-facing face, then retry.' });
+    const image = await readFile(best.framePath);
+    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: best.faceData.width, height: best.faceData.height, time: best.offset, sampleCount: offsets.length, faces: best.faceData.faces.map((face, index) => normalizeFace(face, best.faceData.width, best.faceData.height, index)) };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
 
