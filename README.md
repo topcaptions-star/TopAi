@@ -14,7 +14,7 @@ SPEECHMATICS_API_KEY=your_secret_key
 ALLOWED_ORIGIN=*
 MAX_UPLOAD_MB=250
 MAX_TRACK_SECONDS=60
-MAX_TRACK_FRAMES=360
+MAX_TRACK_FRAMES=96
 TRACK_TIMEOUT_MS=240000
 ```
 
@@ -27,9 +27,10 @@ Never put the Speechmatics key in GitHub, the ZXP, or panel JavaScript.
 | `GET /health` | Health and tracking capability |
 | `GET /healthz` | Basic health check |
 | `POST /transcribe` | Speechmatics transcript from multipart `media` WAV/video |
-| `POST /track-face` | MediaPipe FaceMesh 478-landmark tracking from multipart MP4 `media` |
+| `POST /track-preview` | Preview image and selectable FaceMesh detections from multipart source video `media` |
+| `POST /auto-face-center` | Shot-aware MediaPipe analysis from multipart source video `media` |
 
-`/track-face` extracts a capped number of low-resolution frames, runs MediaPipe FaceMesh with 478 landmarks, follows the most consistent face, and returns smoothed position, scale, and rotation values. TopAi writes those values as keyed `TopAi FaceMesh` Effect Controls directly on the selected source layer. The CEP client uses a half-resolution proxy and a fixed 48-frame adaptive budget to keep normal requests fast. The service contains no EXE, JSXBIN, or third-party plug-in UI.
+`/track-preview` prepares one low-resolution frame and returns every detected face as a selectable normalized box. `/auto-face-center` receives the selected normalized point, detects scene cuts, follows the nearest matching face with 478 MediaPipe FaceMesh landmarks, and returns smoothed shot-relative center points. The CEP host builds the pre-comp and writes Position keyframes plus Motion Tile locally in After Effects. The service contains no EXE, JSXBIN, Mocha component, or third-party plug-in UI.
 
 All uploaded media, decoded frames, and temporary files are removed after each request.
 
@@ -42,4 +43,4 @@ npm start
 curl http://localhost:10000/health
 ```
 
-`SPEECHMATICS_API_KEY` is required only for `/transcribe`; `/track-face` does not use it.
+`SPEECHMATICS_API_KEY` is required only for `/transcribe`; Auto Face Center endpoints do not use it.

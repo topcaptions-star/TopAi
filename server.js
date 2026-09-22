@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { mkdtemp, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, unlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -25,22 +25,23 @@ let detectorPromise = null;
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use((req, _res, next) => { console.log(JSON.stringify({ event: 'request', method: req.method, path: req.path })); next(); });
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-mediapipe-facemesh-478', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames } }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-mediapipe-facemesh-autofacecenter', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames, workflow: 'preview-select-shot-aware-center' } }));
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'topai-api' }));
 
 function safeName(name = 'media') { return String(name).replace(/[^a-zA-Z0-9._-]/g, '_'); }
 function publicError(error, fallback) { return error?.publicMessage || fallback; }
 function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
 function delaySafeNumber(value, fallback) { const n = Number(value); return Number.isFinite(n) ? n : fallback; }
+function rounded(n, digits = 6) { return Number(Number(n).toFixed(digits)); }
 
 function run(command, args, timeoutMs = processTimeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(Object.assign(new Error('Tracking process timed out'), { publicMessage: 'Face tracking timed out. Try a shorter Work Area.' })); }, timeoutMs);
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); if (stderr.length > 12000) stderr = stderr.slice(-12000); });
     child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', code => { clearTimeout(timer); code === 0 ? resolve() : reject(Object.assign(new Error(`ffmpeg exited ${code}: ${stderr}`), { publicMessage: 'Could not decode the selected video for face tracking.' })); });
+    child.once('close', code => { clearTimeout(timer); code === 0 ? resolve(stderr) : reject(Object.assign(new Error(`ffmpeg exited ${code}: ${stderr}`), { publicMessage: 'Could not decode the selected video for face tracking.' })); });
   });
 }
 
@@ -49,7 +50,7 @@ async function getDetector() {
     detectorPromise = (async () => {
       await tf.setBackend('cpu');
       await tf.ready();
-      return faceLandmarksDetection.createDetector(faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh, { runtime: 'tfjs', maxFaces: 1, refineLandmarks: true });
+      return faceLandmarksDetection.createDetector(faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh, { runtime: 'tfjs', maxFaces: 5, refineLandmarks: true });
     })();
   }
   return detectorPromise;
@@ -58,58 +59,107 @@ async function getDetector() {
 function faceArea(face) { return Math.max(0, face.box.width) * Math.max(0, face.box.height); }
 function faceCenter(face) { return { x: face.box.xMin + face.box.width / 2, y: face.box.yMin + face.box.height / 2 }; }
 function landmark(face, index) { return face.keypoints?.[index] || null; }
-function normalizedPoint(point, width, height) { return point ? { x: Number((point.x / width).toFixed(6)), y: Number((point.y / height).toFixed(6)), z: Number((point.z || 0).toFixed(6)) } : null; }
-function selectFace(faces, prior, width, height) {
-  if (!faces?.length) return null;
-  if (!prior) return [...faces].sort((a, b) => faceArea(b) - faceArea(a))[0];
-  return [...faces].sort((a, b) => {
-    const ca = faceCenter(a); const cb = faceCenter(b);
-    const da = ((ca.x / width) - prior.x) ** 2 + ((ca.y / height) - prior.y) ** 2;
-    const db = ((cb.x / width) - prior.x) ** 2 + ((cb.y / height) - prior.y) ** 2;
-    return da - db;
-  })[0];
+function normalizeFace(face, width, height, index) {
+  const nose = landmark(face, 1) || faceCenter(face);
+  const leftEye = landmark(face, 33); const rightEye = landmark(face, 263);
+  const eyeDistance = leftEye && rightEye ? Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y) : Math.max(face.box.width, face.box.height) * 0.45;
+  return {
+    id: index,
+    x: rounded(nose.x / width),
+    y: rounded(nose.y / height),
+    size: rounded(eyeDistance / width),
+    box: { x: rounded(face.box.xMin / width), y: rounded(face.box.yMin / height), width: rounded(face.box.width / width), height: rounded(face.box.height / height) },
+    score: face.score == null ? null : rounded(Array.isArray(face.score) ? face.score[0] : face.score, 4)
+  };
 }
-function smoothPoints(points) {
-  const alpha = 0.62;
+function chooseFace(faces, seed, previous, width, height) {
+  if (!faces?.length) return null;
+  const normalized = faces.map((face, index) => ({ face, candidate: normalizeFace(face, width, height, index) }));
+  if (seed) return normalized.sort((a, b) => ((a.candidate.x - seed.x) ** 2 + (a.candidate.y - seed.y) ** 2) - ((b.candidate.x - seed.x) ** 2 + (b.candidate.y - seed.y) ** 2))[0];
+  if (previous) return normalized.sort((a, b) => ((a.candidate.x - previous.x) ** 2 + (a.candidate.y - previous.y) ** 2) - ((b.candidate.x - previous.x) ** 2 + (b.candidate.y - previous.y) ** 2))[0];
+  return normalized.sort((a, b) => faceArea(b.face) - faceArea(a.face))[0];
+}
+function smoothCenterPoints(points) {
+  const alpha = 0.38;
   let prior = null;
   return points.map(point => {
     if (!prior) { prior = { ...point }; return point; }
-    const smoothFeature = (current, previous) => !current ? null : !previous ? current : { x: previous.x + alpha * (current.x - previous.x), y: previous.y + alpha * (current.y - previous.y), z: previous.z + alpha * (current.z - previous.z) };
-    const smoothed = { ...point, x: prior.x + alpha * (point.x - prior.x), y: prior.y + alpha * (point.y - prior.y), scale: prior.scale + alpha * (point.scale - prior.scale), rotation: prior.rotation + alpha * (point.rotation - prior.rotation), features: { leftEye: smoothFeature(point.features.leftEye, prior.features.leftEye), rightEye: smoothFeature(point.features.rightEye, prior.features.rightEye), nose: smoothFeature(point.features.nose, prior.features.nose), mouth: smoothFeature(point.features.mouth, prior.features.mouth) } };
-    prior = smoothed;
-    return smoothed;
+    const next = { ...point, x: rounded(prior.x + alpha * (point.x - prior.x)), y: rounded(prior.y + alpha * (point.y - prior.y)) };
+    prior = next;
+    return next;
   });
 }
-
-async function trackFace(videoPath, sampleFps, maxFrames, maxSeconds) {
-  if (!ffmpegPath) throw Object.assign(new Error('ffmpeg-static unavailable'), { publicMessage: 'Face tracking engine is unavailable on the server.' });
-  const workingDir = await mkdtemp(join(tmpdir(), 'topai-track-'));
+function parseShowInfoTimes(stderr) {
+  const hits = []; const regex = /pts_time:([0-9.]+)/g; let match;
+  while ((match = regex.exec(stderr))) hits.push(Number(match[1]));
+  return hits.filter(Number.isFinite);
+}
+function normalizeCuts(cuts, duration) {
+  const minShotSeconds = 0.85;
+  const ordered = [...cuts].filter(t => t > minShotSeconds && t < duration - minShotSeconds).sort((a, b) => a - b);
+  const output = []; let last = 0;
+  for (const cut of ordered) {
+    if (cut - last >= minShotSeconds && duration - cut >= minShotSeconds) { output.push(rounded(cut, 3)); last = cut; }
+  }
+  return output;
+}
+async function detectCuts(videoPath, durationSeconds, sourceStart = 0) {
+  if (!ffmpegPath) return [];
+  const stderr = await run(ffmpegPath, ['-hide_banner', '-loglevel', 'info', '-ss', String(sourceStart), '-t', String(durationSeconds), '-i', videoPath, '-vf', "setpts=PTS-STARTPTS,select='gt(scene,0.32)',showinfo", '-an', '-f', 'null', '-']);
+  return normalizeCuts(parseShowInfoTimes(stderr), durationSeconds);
+}
+function shotsFromCuts(cuts, duration) {
+  const edges = [0, ...cuts, duration]; const shots = [];
+  for (let index = 0; index < edges.length - 1; index += 1) {
+    const start = edges[index]; const end = edges[index + 1];
+    if (end - start >= 0.5) shots.push({ index, start: rounded(start, 4), end: rounded(end, 4) });
+  }
+  return shots;
+}
+async function extractFrames(videoPath, workingDir, sampleFps, maxFrames, durationSeconds, sourceStart = 0) {
+  const pattern = join(workingDir, 'frame-%06d.jpg');
+  await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart), '-t', String(durationSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=640:-2:force_original_aspect_ratio=decrease`, '-frames:v', String(maxFrames), '-q:v', '4', pattern]);
+  return (await readdir(workingDir)).filter(file => file.endsWith('.jpg')).sort();
+}
+async function imageFaces(path) {
+  const buffer = await sharp(path).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
   try {
-    const pattern = join(workingDir, 'frame-%06d.jpg');
-    await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-t', String(maxSeconds), '-i', videoPath, '-vf', `fps=${sampleFps},scale=512:-2:force_original_aspect_ratio=decrease`, '-frames:v', String(maxFrames), '-q:v', '4', pattern]);
-    const frameFiles = (await readdir(workingDir)).filter(file => file.endsWith('.jpg')).sort();
+    const faces = await (await getDetector()).estimateFaces(image, { flipHorizontal: false });
+    return { faces, width: buffer.info.width, height: buffer.info.height };
+  } finally { image.dispose(); }
+}
+async function autoFaceCenter(videoPath, sampleFps, maxFrames, durationSeconds, seed, sourceStart = 0) {
+  if (!ffmpegPath) throw Object.assign(new Error('ffmpeg-static unavailable'), { publicMessage: 'Face tracking engine is unavailable on the server.' });
+  const workingDir = await mkdtemp(join(tmpdir(), 'topai-center-'));
+  try {
+    const frameFiles = await extractFrames(videoPath, workingDir, sampleFps, maxFrames, durationSeconds, sourceStart);
     if (!frameFiles.length) throw Object.assign(new Error('No frames extracted'), { publicMessage: 'The uploaded clip did not contain decodable video frames.' });
-    const detector = await getDetector();
-    const points = []; let prior = null;
+    const cuts = await detectCuts(videoPath, durationSeconds, sourceStart).catch(error => { console.warn(JSON.stringify({ event: 'cut_detect_warning', error: error.message })); return []; });
+    const shots = shotsFromCuts(cuts, durationSeconds);
+    const rawPoints = []; let prior = seed || null;
     for (let index = 0; index < frameFiles.length; index += 1) {
-      const buffer = await sharp(join(workingDir, frameFiles[index])).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-      const image = tf.tensor3d(new Uint8Array(buffer.data), [buffer.info.height, buffer.info.width, buffer.info.channels], 'int32');
-      let faces;
-      try { faces = await detector.estimateFaces(image, { flipHorizontal: false }); } finally { image.dispose(); }
-      const face = selectFace(faces, prior, buffer.info.width, buffer.info.height);
-      if (!face) continue;
-      const leftEye = landmark(face, 33); const rightEye = landmark(face, 263); const nose = landmark(face, 1); const mouth = landmark(face, 13);
-      if (!leftEye || !rightEye || !nose || !mouth) continue;
-      const center = { x: nose.x, y: nose.y };
-      let rotation = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * 180 / Math.PI;
-      while (rotation > 90) rotation -= 180;
-      while (rotation < -90) rotation += 180;
-      const rawConfidence = Array.isArray(face.score) ? face.score[0] : face.score;
-      const point = { time: Number((index / sampleFps).toFixed(4)), x: Number((center.x / buffer.info.width).toFixed(6)), y: Number((center.y / buffer.info.height).toFixed(6)), scale: Number((Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y) / buffer.info.width).toFixed(6)), rotation: Number(rotation.toFixed(4)), confidence: rawConfidence == null ? null : Number(rawConfidence.toFixed(4)), features: { leftEye: normalizedPoint(leftEye, buffer.info.width, buffer.info.height), rightEye: normalizedPoint(rightEye, buffer.info.width, buffer.info.height), nose: normalizedPoint(nose, buffer.info.width, buffer.info.height), mouth: normalizedPoint(mouth, buffer.info.width, buffer.info.height) } };
-      prior = point; points.push(point);
+      const { faces, width, height } = await imageFaces(join(workingDir, frameFiles[index]));
+      const pick = chooseFace(faces, seed, prior, width, height);
+      if (!pick) continue;
+      prior = pick.candidate;
+      rawPoints.push({ time: rounded(index / sampleFps, 4), x: pick.candidate.x, y: pick.candidate.y, confidence: pick.candidate.score });
     }
-    if (!points.length) throw Object.assign(new Error('No face detected'), { publicMessage: 'No face was detected in the selected clip. Use a clearer front-facing shot or a shorter Work Area.' });
-    return { sampleFps, framesAnalyzed: frameFiles.length, landmarksPerFace: 478, points: smoothPoints(points) };
+    if (rawPoints.length < 2) throw Object.assign(new Error('No face detected'), { publicMessage: 'No stable face was detected in the selected clip. Choose a clearer face or shorten the Work Area.' });
+    const points = smoothCenterPoints(rawPoints);
+    const enrichedShots = shots.map(shot => ({ ...shot, points: points.filter(point => point.time >= shot.start - 1e-4 && point.time <= shot.end + 1e-4) })).filter(shot => shot.points.length >= 2);
+    if (!enrichedShots.length) throw Object.assign(new Error('No trackable shots'), { publicMessage: 'Face tracking data did not cover a usable shot.' });
+    return { sampleFps, framesAnalyzed: frameFiles.length, landmarksPerFace: 478, cuts, shots: enrichedShots };
+  } finally { await rm(workingDir, { recursive: true, force: true }); }
+}
+async function previewFaces(videoPath, durationSeconds, sourceStart = 0) {
+  if (!ffmpegPath) throw Object.assign(new Error('ffmpeg-static unavailable'), { publicMessage: 'Face tracking engine is unavailable on the server.' });
+  const workingDir = await mkdtemp(join(tmpdir(), 'topai-preview-'));
+  try {
+    const framePath = join(workingDir, 'preview.jpg');
+    await run(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-ss', String(sourceStart + Math.min(0.4, Math.max(0, durationSeconds / 8))), '-i', videoPath, '-frames:v', '1', '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease', '-q:v', '4', framePath]);
+    const [image, faceData] = await Promise.all([readFile(framePath), imageFaces(framePath)]);
+    return { imageBase64: image.toString('base64'), mime: 'image/jpeg', width: faceData.width, height: faceData.height, faces: faceData.faces.map((face, index) => normalizeFace(face, faceData.width, faceData.height, index)) };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
 
@@ -163,25 +213,46 @@ app.post('/transcribe', upload.single('media'), async (req, res) => {
   } finally { await unlink(mediaPath).catch(() => {}); }
 });
 
-app.post('/track-face', upload.single('media'), async (req, res) => {
+app.post('/track-preview', upload.single('media'), async (req, res) => {
   const requestId = randomUUID();
-  const started = Date.now();
   if (!req.file) return res.status(400).json({ error: 'Send a video file in multipart field: media' });
-  const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 4), 2, 12);
+  const durationSeconds = clamp(delaySafeNumber(req.body.durationSeconds, maxTrackSeconds), 1, maxTrackSeconds);
+  const sourceStart = Math.max(0, delaySafeNumber(req.body.sourceStart, 0));
+  const mediaPath = join(tmpdir(), `topai-preview-source-${requestId}-${safeName(req.file.originalname)}`);
+  try {
+    console.log(JSON.stringify({ event: 'preview_received', requestId, bytes: req.file.size, durationSeconds, sourceStart }));
+    await writeFile(mediaPath, req.file.buffer);
+    const preview = await previewFaces(mediaPath, durationSeconds, sourceStart);
+    console.log(JSON.stringify({ event: 'preview_done', requestId, faces: preview.faces.length }));
+    return res.json({ ok: true, preview, engine: 'topai-mediapipe-facemesh-478' });
+  } catch (error) {
+    const status = error?.publicMessage?.startsWith('No stable') ? 422 : 502;
+    console.error(JSON.stringify({ event: 'preview_error', requestId, error: error.message }));
+    return res.status(status).json({ error: publicError(error, 'Could not prepare face selection.') });
+  } finally { await unlink(mediaPath).catch(() => {}); }
+});
+
+app.post('/auto-face-center', upload.single('media'), async (req, res) => {
+  const requestId = randomUUID(); const started = Date.now();
+  if (!req.file) return res.status(400).json({ error: 'Send a video file in multipart field: media' });
+  const requestedFps = clamp(delaySafeNumber(req.body.sampleFps, 6), 2, 12);
   const maxFrames = clamp(Math.round(delaySafeNumber(req.body.maxFrames, maxTrackFrames)), 12, maxTrackFrames);
   const durationSeconds = clamp(delaySafeNumber(req.body.durationSeconds, maxTrackSeconds), 1, maxTrackSeconds);
   const sampleFps = Math.max(1, Math.min(requestedFps, maxFrames / durationSeconds));
-  const mediaPath = join(tmpdir(), `topai-track-source-${requestId}-${safeName(req.file.originalname)}`);
+  const sourceStart = Math.max(0, delaySafeNumber(req.body.sourceStart, 0));
+  let seed = null;
+  if (req.body.seedX !== undefined && req.body.seedY !== undefined) seed = { x: clamp(delaySafeNumber(req.body.seedX, 0.5), 0, 1), y: clamp(delaySafeNumber(req.body.seedY, 0.5), 0, 1) };
+  const mediaPath = join(tmpdir(), `topai-center-source-${requestId}-${safeName(req.file.originalname)}`);
   try {
-    console.log(JSON.stringify({ event: 'track_received', requestId, bytes: req.file.size, requestedFps, sampleFps, maxFrames, durationSeconds }));
+    console.log(JSON.stringify({ event: 'center_received', requestId, bytes: req.file.size, requestedFps, sampleFps, maxFrames, durationSeconds, sourceStart, hasSeed: Boolean(seed) }));
     await writeFile(mediaPath, req.file.buffer);
-    const tracked = await trackFace(mediaPath, sampleFps, maxFrames, durationSeconds);
-    console.log(JSON.stringify({ event: 'track_done', requestId, points: tracked.points.length, durationMs: Date.now() - started }));
-    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-mediapipe-facemesh-478', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.62' } });
+    const tracked = await autoFaceCenter(mediaPath, sampleFps, maxFrames, durationSeconds, seed, sourceStart);
+    console.log(JSON.stringify({ event: 'center_done', requestId, shots: tracked.shots.length, cuts: tracked.cuts.length, points: tracked.shots.reduce((count, shot) => count + shot.points.length, 0), durationMs: Date.now() - started }));
+    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-mediapipe-autofacecenter', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.38', composition: 'shot-aware-reframe' } });
   } catch (error) {
-    const status = error?.publicMessage?.startsWith('No face') ? 422 : 502;
-    console.error(JSON.stringify({ event: 'track_error', requestId, error: error.message }));
-    return res.status(status).json({ error: publicError(error, 'Face tracking failed') });
+    const status = error?.publicMessage?.startsWith('No') ? 422 : 502;
+    console.error(JSON.stringify({ event: 'center_error', requestId, error: error.message }));
+    return res.status(status).json({ error: publicError(error, 'Auto Face Center failed') });
   } finally { await unlink(mediaPath).catch(() => {}); }
 });
 
