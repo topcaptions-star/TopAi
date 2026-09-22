@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { openAsBlob } from 'node:fs';
 import { BatchClient } from '@speechmatics/batch-client';
 import * as tf from '@tensorflow/tfjs-node';
-import * as faceDetection from '@tensorflow-models/face-detection';
+import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
 import ffmpegPath from 'ffmpeg-static';
 import sharp from 'sharp';
 
@@ -25,7 +25,7 @@ let detectorPromise = null;
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use((req, _res, next) => { console.log(JSON.stringify({ event: 'request', method: req.method, path: req.path })); next(); });
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-server-face-detection', maxTrackSeconds, maxTrackFrames } }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'topai-api', tracking: { enabled: true, engine: 'topai-mediapipe-facemesh-478', landmarksPerFace: 478, maxTrackSeconds, maxTrackFrames } }));
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'topai-api' }));
 
 function safeName(name = 'media') { return String(name).replace(/[^a-zA-Z0-9._-]/g, '_'); }
@@ -49,7 +49,7 @@ async function getDetector() {
     detectorPromise = (async () => {
       await tf.setBackend('cpu');
       await tf.ready();
-      return faceDetection.createDetector(faceDetection.SupportedModels.MediaPipeFaceDetector, { runtime: 'tfjs', modelType: 'short', maxFaces: 1 });
+      return faceLandmarksDetection.createDetector(faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh, { runtime: 'tfjs', maxFaces: 1, refineLandmarks: true });
     })();
   }
   return detectorPromise;
@@ -57,6 +57,8 @@ async function getDetector() {
 
 function faceArea(face) { return Math.max(0, face.box.width) * Math.max(0, face.box.height); }
 function faceCenter(face) { return { x: face.box.xMin + face.box.width / 2, y: face.box.yMin + face.box.height / 2 }; }
+function landmark(face, index) { return face.keypoints?.[index] || null; }
+function normalizedPoint(point, width, height) { return point ? { x: Number((point.x / width).toFixed(6)), y: Number((point.y / height).toFixed(6)), z: Number((point.z || 0).toFixed(6)) } : null; }
 function selectFace(faces, prior, width, height) {
   if (!faces?.length) return null;
   if (!prior) return [...faces].sort((a, b) => faceArea(b) - faceArea(a))[0];
@@ -67,13 +69,13 @@ function selectFace(faces, prior, width, height) {
     return da - db;
   })[0];
 }
-function keypoint(face, name) { return face.keypoints?.find(point => point.name === name); }
 function smoothPoints(points) {
   const alpha = 0.62;
   let prior = null;
   return points.map(point => {
     if (!prior) { prior = { ...point }; return point; }
-    const smoothed = { ...point, x: prior.x + alpha * (point.x - prior.x), y: prior.y + alpha * (point.y - prior.y), scale: prior.scale + alpha * (point.scale - prior.scale), rotation: prior.rotation + alpha * (point.rotation - prior.rotation) };
+    const smoothFeature = (current, previous) => !current ? null : !previous ? current : { x: previous.x + alpha * (current.x - previous.x), y: previous.y + alpha * (current.y - previous.y), z: previous.z + alpha * (current.z - previous.z) };
+    const smoothed = { ...point, x: prior.x + alpha * (point.x - prior.x), y: prior.y + alpha * (point.y - prior.y), scale: prior.scale + alpha * (point.scale - prior.scale), rotation: prior.rotation + alpha * (point.rotation - prior.rotation), features: { leftEye: smoothFeature(point.features.leftEye, prior.features.leftEye), rightEye: smoothFeature(point.features.rightEye, prior.features.rightEye), nose: smoothFeature(point.features.nose, prior.features.nose), mouth: smoothFeature(point.features.mouth, prior.features.mouth) } };
     prior = smoothed;
     return smoothed;
   });
@@ -96,16 +98,18 @@ async function trackFace(videoPath, sampleFps, maxFrames, maxSeconds) {
       try { faces = await detector.estimateFaces(image, { flipHorizontal: false }); } finally { image.dispose(); }
       const face = selectFace(faces, prior, buffer.info.width, buffer.info.height);
       if (!face) continue;
-      const center = faceCenter(face); const leftEye = keypoint(face, 'leftEye'); const rightEye = keypoint(face, 'rightEye');
-      let rotation = leftEye && rightEye ? Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * 180 / Math.PI : 0;
+      const leftEye = landmark(face, 33); const rightEye = landmark(face, 263); const nose = landmark(face, 1); const mouth = landmark(face, 13);
+      if (!leftEye || !rightEye || !nose || !mouth) continue;
+      const center = { x: nose.x, y: nose.y };
+      let rotation = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * 180 / Math.PI;
       while (rotation > 90) rotation -= 180;
       while (rotation < -90) rotation += 180;
       const rawConfidence = Array.isArray(face.score) ? face.score[0] : face.score;
-      const point = { time: Number((index / sampleFps).toFixed(4)), x: Number((center.x / buffer.info.width).toFixed(6)), y: Number((center.y / buffer.info.height).toFixed(6)), scale: Number((face.box.width / buffer.info.width).toFixed(6)), rotation: Number(rotation.toFixed(4)), confidence: rawConfidence == null ? null : Number(rawConfidence.toFixed(4)) };
+      const point = { time: Number((index / sampleFps).toFixed(4)), x: Number((center.x / buffer.info.width).toFixed(6)), y: Number((center.y / buffer.info.height).toFixed(6)), scale: Number((Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y) / buffer.info.width).toFixed(6)), rotation: Number(rotation.toFixed(4)), confidence: rawConfidence == null ? null : Number(rawConfidence.toFixed(4)), features: { leftEye: normalizedPoint(leftEye, buffer.info.width, buffer.info.height), rightEye: normalizedPoint(rightEye, buffer.info.width, buffer.info.height), nose: normalizedPoint(nose, buffer.info.width, buffer.info.height), mouth: normalizedPoint(mouth, buffer.info.width, buffer.info.height) } };
       prior = point; points.push(point);
     }
     if (!points.length) throw Object.assign(new Error('No face detected'), { publicMessage: 'No face was detected in the selected clip. Use a clearer front-facing shot or a shorter Work Area.' });
-    return { sampleFps, framesAnalyzed: frameFiles.length, points: smoothPoints(points) };
+    return { sampleFps, framesAnalyzed: frameFiles.length, landmarksPerFace: 478, points: smoothPoints(points) };
   } finally { await rm(workingDir, { recursive: true, force: true }); }
 }
 
@@ -171,7 +175,7 @@ app.post('/track-face', upload.single('media'), async (req, res) => {
     await writeFile(mediaPath, req.file.buffer);
     const tracked = await trackFace(mediaPath, sampleFps, maxFrames, maxTrackSeconds);
     console.log(JSON.stringify({ event: 'track_done', requestId, points: tracked.points.length, durationMs: Date.now() - started }));
-    return res.json({ ok: true, tracking: { ...tracked, coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.62' } });
+    return res.json({ ok: true, tracking: { ...tracked, engine: 'topai-mediapipe-facemesh-478', coordinateSpace: 'normalized-video-frame', smoothing: 'ema-0.62' } });
   } catch (error) {
     const status = error?.publicMessage?.startsWith('No face') ? 422 : 502;
     console.error(JSON.stringify({ event: 'track_error', requestId, error: error.message }));

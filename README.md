@@ -27,9 +27,9 @@ Never put the Speechmatics key in GitHub, the ZXP, or panel JavaScript.
 | `GET /health` | Health and tracking capability |
 | `GET /healthz` | Basic health check |
 | `POST /transcribe` | Speechmatics transcript from multipart `media` WAV/video |
-| `POST /track-face` | Original server-side face detection from multipart MP4 `media` |
+| `POST /track-face` | MediaPipe FaceMesh 478-landmark tracking from multipart MP4 `media` |
 
-`/track-face` extracts a capped number of low-resolution frames, detects the most consistent face, smooths the normalized center/size/rotation points, and returns the keyframes required by After Effects. It contains no EXE, JSXBIN, or third-party plug-in UI.
+`/track-face` extracts a capped number of low-resolution frames, runs MediaPipe FaceMesh with 478 landmarks, follows the most consistent face, smooths head and feature points, and returns keyframes for the After Effects Head, Left Eye, Right Eye, Nose, and Mouth Nulls. It contains no EXE, JSXBIN, or third-party plug-in UI.
 
 All uploaded media, decoded frames, and temporary files are removed after each request.
 
