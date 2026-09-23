@@ -74,7 +74,7 @@ function expireCenterJob(jobId) {
 }
 function createCenterJob({ mediaPath, sampleFps, maxFrames, durationSeconds, sourceStart, seed }) {
   const jobId = randomUUID();
-  const job = { id: jobId, state: 'processing', createdAt: Date.now(), mediaPath, result: null, error: null };
+  const job = { id: jobId, kind: 'center', state: 'processing', createdAt: Date.now(), mediaPath, result: null, error: null };
   centerJobs.set(jobId, job);
   runTrackingWorker({ action: 'track', videoPath: mediaPath, durationSeconds, sourceStart, sampleFps, maxFrames, seed })
     .then(tracked => {
@@ -86,6 +86,24 @@ function createCenterJob({ mediaPath, sampleFps, maxFrames, durationSeconds, sou
       job.state = 'failed';
       job.error = publicError(error, 'Auto Center failed');
       console.error(JSON.stringify({ event: 'center_job_error', jobId, error: error.message }));
+    })
+    .finally(() => { if (job.mediaPath) unlink(job.mediaPath).catch(() => {}); job.mediaPath = null; setTimeout(() => expireCenterJob(jobId), 10 * 60 * 1000); });
+  return job;
+}
+function createPreviewJob({ mediaPath, durationSeconds, sourceStart }) {
+  const jobId = randomUUID();
+  const job = { id: jobId, kind: 'preview', state: 'processing', createdAt: Date.now(), mediaPath, result: null, error: null };
+  centerJobs.set(jobId, job);
+  runTrackingWorker({ action: 'preview', videoPath: mediaPath, durationSeconds, sourceStart })
+    .then(preview => {
+      job.state = 'complete';
+      job.result = preview;
+      console.log(JSON.stringify({ event: 'preview_job_done', jobId, faces: preview.faces.length, durationMs: Date.now() - job.createdAt }));
+    })
+    .catch(error => {
+      job.state = 'failed';
+      job.error = publicError(error, 'Could not prepare subject selection.');
+      console.error(JSON.stringify({ event: 'preview_job_error', jobId, error: error.message }));
     })
     .finally(() => { if (job.mediaPath) unlink(job.mediaPath).catch(() => {}); job.mediaPath = null; setTimeout(() => expireCenterJob(jobId), 10 * 60 * 1000); });
   return job;
@@ -342,14 +360,13 @@ app.post('/track-preview', upload.single('media'), async (req, res) => {
   try {
     console.log(JSON.stringify({ event: 'preview_received', requestId, bytes: req.file.size, durationSeconds, sourceStart }));
     await writeFile(mediaPath, req.file.buffer);
-    const preview = await runTrackingWorker({ action: 'preview', videoPath: mediaPath, durationSeconds, sourceStart });
-    console.log(JSON.stringify({ event: 'preview_done', requestId, faces: preview.faces.length }));
-    return res.json({ ok: true, preview, engine: 'topai-person-worker' });
+    const job = createPreviewJob({ mediaPath, durationSeconds, sourceStart });
+    return res.status(202).json({ ok: true, state: job.state, jobId: job.id, pollUrl: `/auto-center-jobs/${job.id}` });
   } catch (error) {
     const status = error?.publicMessage?.startsWith('No stable') ? 422 : 502;
     console.error(JSON.stringify({ event: 'preview_error', requestId, error: error.message }));
     return res.status(status).json({ error: publicError(error, 'Could not prepare face selection.') });
-  } finally { await unlink(mediaPath).catch(() => {}); }
+  }
 });
 
 app.post('/auto-face-center', upload.single('media'), async (req, res) => {
@@ -377,7 +394,7 @@ app.post('/auto-face-center', upload.single('media'), async (req, res) => {
 app.get('/auto-center-jobs/:jobId', (req, res) => {
   const job = centerJobs.get(String(req.params.jobId));
   if (!job) return res.status(404).json({ error: 'Auto Center job expired or the server restarted. Please retry.' });
-  if (job.state === 'complete') return res.json({ ok: true, state: 'complete', tracking: job.result });
+  if (job.state === 'complete') return res.json(job.kind === 'preview' ? { ok: true, state: 'complete', preview: job.result } : { ok: true, state: 'complete', tracking: job.result });
   if (job.state === 'failed') return res.status(422).json({ ok: false, state: 'failed', error: job.error || 'Auto Center failed.' });
   return res.status(202).json({ ok: true, state: 'processing', elapsedSeconds: Math.round((Date.now() - job.createdAt) / 1000) });
 });
