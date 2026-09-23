@@ -27,10 +27,10 @@ Never put the Speechmatics key in GitHub, the ZXP, or panel JavaScript.
 | `GET /health` | Health and tracking capability |
 | `GET /healthz` | Basic health check |
 | `POST /transcribe` | Speechmatics transcript from multipart `media` WAV/video |
-| `POST /track-preview` | Preview image and selectable FaceMesh detections from multipart source video `media` |
-| `POST /auto-face-center` | Shot-aware MediaPipe analysis from multipart source video `media` |
+| `POST /track-preview` | Lightweight preview image from multipart source video `media` |
+| `POST /auto-face-center` | Continuous optical tracking from the retained preview upload or multipart source video `media` |
 
-`/track-preview` prepares one low-resolution frame and returns every detected face as a selectable normalized box. `/auto-face-center` receives the selected normalized point, detects scene cuts, follows the nearest matching face with 478 MediaPipe FaceMesh landmarks, and returns smoothed shot-relative center points. The CEP host builds the pre-comp and writes Position keyframes plus Motion Tile locally in After Effects. The service contains no EXE, JSXBIN, Mocha component, or third-party plug-in UI.
+`/track-preview` prepares one lightweight frame. The user clicks the intended subject, then `/auto-face-center` follows visual features around that selected point with Lucas–Kanade optical flow at up to six samples per second. The preview upload can be referenced through `previewJobId`, avoiding a second media upload. The CEP host builds the pre-comp and writes Position keyframes plus Motion Tile locally in After Effects. The service contains no EXE, JSXBIN, Mocha component, or third-party plug-in UI.
 
 All uploaded media, decoded frames, and temporary files are removed after each request.
 

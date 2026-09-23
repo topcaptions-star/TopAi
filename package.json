@@ -1,6 +1,6 @@
 {
   "name": "topai-api",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,14 +12,11 @@
   },
   "dependencies": {
     "@speechmatics/batch-client": "latest",
-    "@tensorflow-models/coco-ssd": "^2.2.3",
-    "@tensorflow-models/face-detection": "^1.0.3",
-    "@tensorflow-models/face-landmarks-detection": "^1.0.6",
-    "@tensorflow/tfjs-node": "^4.22.0",
+    "@techstark/opencv-js": "^5.0.0-release.1",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "ffmpeg-static": "^5.2.0",
     "multer": "^2.0.2",
-    "sharp": "^0.34.3"
+    "sharp": "^0.34.5"
   }
 }
